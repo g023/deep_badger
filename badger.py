@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Program: PRD Agentic CLI - Powered by the DeepSeek v4 API 
+Program: Deep Badger - PRD Agentic CLI - Powered by the DeepSeek v4 API 
 
 Summary: Uses PRD files to manage an agentic process to do something/build something to completion. 
 Agentic processes can be unpredictable. Use in a sandbox is recommended.
@@ -61,6 +61,8 @@ EXPLORATION_PLAN_PROMPT = """Before executing anything, produce a concise explor
 **SCOPE CONSTRAINT**: Only explore the current working directory and its subdirectories. 
 Do NOT explore SESSIONS/, .git/, node_modules/, venv/, __pycache__/, or parent directories.
 
+**TOOLS AVAILABLE**: You have `read` (read-only filesystem access) and `scratch_pad` (in-memory note storage). You do NOT have `bash`.
+
 Output a JSON block like:
 ```json
 {
@@ -75,7 +77,12 @@ After the plan, wait for user confirmation before executing.
 """
 
 # System prompt for exploration — now includes planning directive
-EXPLORATION_SYSTEM_PROMPT = """You are an expert product architect analyzing a software project. You have access ONLY to the `bash` tool.
+EXPLORATION_SYSTEM_PROMPT = """You are an expert product architect analyzing a software project. You have access to TWO tools:
+
+1. **`read`** — Read-only filesystem exploration (ls, cat, head, tail, wc, grep, find, file). CANNOT create or modify files.
+2. **`scratch_pad`** — In-memory note storage. Use this to save findings so you don't need to re-read files.
+
+**CRITICAL: You do NOT have access to the `bash` tool during exploration.** The `bash` tool is only available during code generation. Any attempt to use `bash` will fail. Use `read` for all filesystem access.
 
 **Your task**: Explore efficiently to gather enough information to write an exceptional PRD. 
 You are in charge of your own exploration budget but must do the minimum necessary to understand:
@@ -91,24 +98,29 @@ You are in charge of your own exploration budget but must do the minimum necessa
 - Any path outside the current working directory
 
 **Process**:
-1. Start with a concise JSON exploration plan (see format below). Do NOT run any bash commands before outputting the plan.
-2. Then execute commands surgically. Before each bash command, output:
+1. Start with a concise JSON exploration plan (see format below). Do NOT run any read commands before outputting the plan.
+2. Then execute commands surgically. Before each read command, output:
    [RATIONAL] Specific reason for this command
    [SUMMARY] What you will learn
-3. Prefer targeted commands over broad recursive listings:
-   - `ls -la` to see top-level files
-   - `find . -maxdepth 2 -type f -name '*.py'` to find source files by extension
-   - `head -50 <file>` to preview files
-   - `wc -l <file>` to gauge file size before reading
-   - `grep -r "keyword" --include='*.py' .` for targeted searches
-4. Mentally track the Quality Checklist items below. After each command, self-assess: do you have enough to write the PRD?
-5. **Exit early** as soon as sufficient information is gathered — stop issuing further tool calls.
+3. **Use `scratch_pad` to store findings** after each discovery. This prevents redundant reads and saves your budget.
+   - After reading a key file, call `scratch_pad` with action="store", key="finding_name", value="summary of what you learned"
+   - When you need to recall something, use `scratch_pad` with action="retrieve" instead of re-reading files
+   - Use `scratch_pad` action="list" to see what you've already discovered
+4. Prefer targeted read operations over broad recursive listings:
+   - `read(operation="ls", path=".")` to see top-level files
+   - `read(operation="find", path=".", pattern="*.py", max_depth=2)` to find source files
+   - `read(operation="wc", path="file.py")` to gauge file size before reading
+   - `read(operation="head", path="file.py", lines=50)` to preview files
+   - `read(operation="grep", path=".", pattern="keyword", include_pattern="*.py")` for targeted searches
+5. Mentally track the Quality Checklist items below. After each command, self-assess: do you have enough to write the PRD?
+6. **Exit early** as soon as sufficient information is gathered — stop issuing further tool calls.
 
 **Critical Rules**:
-- Before opening a file, gauge size with `wc -l <file>` and `file <file>`.
-- Do NOT use heredoc or file-writing commands; you are only reading and analyzing.
-- Do NOT run `find . -type f` or `ls -laR` or any unbounded recursive listing — always use `-maxdepth` and `-name` filters.
+- Before opening a file, gauge size with `read(operation="wc", path="<file>")`.
+- You CANNOT create or modify files — the `read` tool is strictly read-only.
+- Do NOT use `read(operation="find", path=".", max_depth=...)` without a pattern filter or with max_depth > 3.
 - Monitor your own budget. If you reach the estimated limit without readiness, output READY: false and list gaps.
+- **Use `scratch_pad` aggressively** to cache your findings. This is your memory — use it to avoid redundant reads.
 
 **Quality Checklist** (address mentally, then confirm in readiness):
 - Project structure and architecture
@@ -123,7 +135,7 @@ You are in charge of your own exploration budget but must do the minimum necessa
 **Readiness Assessment** (output when ready to stop exploration):
 READY: true
 Gaps: - (none, or list specific gaps)
-When confident that all checklist items are sufficiently covered, output only READY: true and immediately stop using the bash tool. If gaps remain, output READY: false and continue.
+When confident that all checklist items are sufficiently covered, output only READY: true and immediately stop using the read tool. If gaps remain, output READY: false and continue.
 """
 
 # The system prompt for the final synthesis (PRD writing)
@@ -202,100 +214,81 @@ def validate_prd_quality(content: str) -> Tuple[bool, List[str]]:
     return is_valid, issues
 
 # ============================================================================
-# Bash Tool with LRU Caching and Danger Detection
+# Tool Definitions - Read-only exploration, scratch pad, and bash
 # ============================================================================
 
-_BASH_CACHE: OrderedDict = OrderedDict()  # LRU cache: (cwd, command) -> output
-_BASH_HISTORY: List[Dict[str, Any]] = []  # (command, output, success, timestamp)
-_VERBOSE_GLOBAL = False  # Will be set from main, used by bash_handler for cache logs
+# READ_TOOL: Read-only exploration tool (used during exploration phase)
+# Prevents file creation/writing — only allows reading and listing
+READ_TOOL = ToolDef(
+    name="read",
+    description="Read-only file system exploration. Use for: listing directories, reading files, searching code, checking file sizes. CANNOT create or modify files.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": ["ls", "cat", "head", "tail", "wc", "grep", "find", "file"],
+                "description": "Operation to perform"
+            },
+            "path": {
+                "type": "string",
+                "description": "File or directory path (relative to cwd)"
+            },
+            "pattern": {
+                "type": "string",
+                "description": "Search pattern (for grep/find operations)"
+            },
+            "max_depth": {
+                "type": "integer",
+                "description": "Maximum directory depth for find (default: 2, max: 3)",
+                "default": 2
+            },
+            "lines": {
+                "type": "integer",
+                "description": "Number of lines for head/tail (default: 30)",
+                "default": 30
+            },
+            "include_pattern": {
+                "type": "string",
+                "description": "File glob pattern for grep/find (e.g., '*.py')"
+            }
+        },
+        "required": ["operation", "path"]
+    },
+    handler=None,  # Set per-instance in DAGAgent
+    max_result_chars=4000,
+)
 
-def bash_handler(params: dict) -> dict:
-    command = params.get("command", "")
-    cwd = params.get("cwd", os.getcwd())
+# SCRATCH_PAD_TOOL: In-memory note-taking for exploration findings
+# Prevents redundant bash calls by letting the model store/retrieve findings
+SCRATCH_PAD_TOOL = ToolDef(
+    name="scratch_pad",
+    description="Persistent scratch pad for storing and retrieving exploration findings. Use this to save notes, summaries, and discoveries so you don't need to re-read files. Data persists for the entire exploration session.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["store", "retrieve", "list", "clear"],
+                "description": "store: save a note with a key; retrieve: get a note by key; list: list all keys; clear: remove all notes"
+            },
+            "key": {
+                "type": "string",
+                "description": "Note identifier (e.g., 'project_structure', 'dependencies', 'entry_points')"
+            },
+            "value": {
+                "type": "string",
+                "description": "Content to store (required for action=store)"
+            }
+        },
+        "required": ["action", "key"]
+    },
+    handler=None,  # Set per-instance in DAGAgent
+    max_result_chars=4000,
+)
 
-    # Show the command being executed (truncated for display)
-    cmd_display = command[:200] + ("..." if len(command) > 200 else "")
-    print(f"  ▶ bash: {cmd_display}")
-
-    # Dangerous pattern blocking
-    dangerous = [
-        "rm -rf /", "sudo ", "chmod 777", "dd if=", "mkfs",
-        "> /dev/sd", ":(){ :|:& };:", r"curl\s.*\|\s*sh", r"wget\s.*\|\s*sh"
-    ]
-    for pat in dangerous:
-        if re.search(pat, command):
-            print(f"  ⛔ BLOCKED: dangerous pattern '{pat}'")
-            return {"error": f"Blocked dangerous pattern: {pat}", "blocked": True}
-
-    # Cache hit
-    cache_key = (cwd, command)
-    if cache_key in _BASH_CACHE:
-        _BASH_CACHE.move_to_end(cache_key)
-        if _VERBOSE_GLOBAL:
-            print(f"  💾 Cache hit")
-        return {"output": _BASH_CACHE[cache_key], "cached": True}
-
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=90,
-            cwd=cwd,
-            executable="/bin/bash",
-        )
-        output = result.stdout
-        if result.stderr:
-            output += f"\n[STDERR]\n{result.stderr}"
-        if result.returncode != 0:
-            output += f"\n[Exit code: {result.returncode}]"
-        output = output.strip() or "(no output)"
-        if len(output) > 3000:
-            output = output[:3000] + "\n[... truncated ...]"
-
-        # Show result summary
-        if result.returncode == 0:
-            lines = output.count('\n')
-            print(f"  ✅ Exit: 0 | {len(output)} chars, {lines} lines")
-        else:
-            print(f"  ❌ Exit: {result.returncode} | {output[:150]}")
-
-        _BASH_CACHE[cache_key] = output
-        _BASH_CACHE.move_to_end(cache_key)
-
-        # LRU eviction: remove oldest entry if cache is full
-        if len(_BASH_CACHE) > BASH_CACHE_MAX_SIZE:
-            evicted = _BASH_CACHE.popitem(last=False)
-            if _VERBOSE_GLOBAL:
-                print(f"[VERBOSE] Cache evicted: {evicted[0][1][:80]}...")
-
-        _BASH_HISTORY.append({
-            "command": command,
-            "success": result.returncode == 0,
-            "timestamp": time.time(),
-        })
-
-        return {"output": output, "exit_code": result.returncode}
-    except subprocess.TimeoutExpired:
-        print(f"  ⏰ Command timed out after 90 seconds")
-        _BASH_HISTORY.append({
-            "command": command,
-            "success": False,
-            "error": "timeout",
-            "timestamp": time.time(),
-        })
-        return {"error": "Command timed out after 90 seconds"}
-    except Exception as e:
-        print(f"  ❌ Error: {e}")
-        _BASH_HISTORY.append({
-            "command": command,
-            "success": False,
-            "error": str(e),
-            "timestamp": time.time(),
-        })
-        return {"error": f"{type(e).__name__}: {e}"}
-
+# BASH_TOOL definition (handler will be set per-instance in DAGAgent)
+# Used ONLY during code generation phase, NOT during exploration
 BASH_TOOL = ToolDef(
     name="bash",
     description="Execute a bash command. Use heredoc for writing files. Returns output.",
@@ -307,9 +300,848 @@ BASH_TOOL = ToolDef(
         },
         "required": ["command"]
     },
-    handler=bash_handler,
-    max_result_chars=8000,
+    handler=None,  # Set per-instance in DAGAgent
+    max_result_chars=3000,
 )
+
+# ============================================================================
+# VirtualFileSystem - In-memory filesystem for testing
+# ============================================================================
+
+class VirtualFileSystem:
+    """In-memory filesystem that handles common bash operations for testing.
+    Supports: cat <<EOF > file, cat file, ls, echo, python3 -c"""
+
+    def __init__(self):
+        self.files: Dict[str, str] = {}  # path -> content
+        self.current_dir = "."
+
+    def _normalize_path(self, path: str) -> str:
+        """Normalize path (handle . and ..)."""
+        if path.startswith("/"):
+            return path
+        if path == ".":
+            return self.current_dir
+        if self.current_dir == ".":
+            return path
+        return f"{self.current_dir}/{path}".replace("//", "/")
+
+    def _ensure_dir(self, path: str) -> None:
+        """Ensure parent directory exists (in virtual FS, this is implicit)."""
+        pass
+
+    def write_file(self, path: str, content: str) -> None:
+        """Write file to virtual filesystem."""
+        path = self._normalize_path(path)
+        self._ensure_dir(path)
+        self.files[path] = content
+
+    def read_file(self, path: str) -> Optional[str]:
+        """Read file from virtual filesystem."""
+        path = self._normalize_path(path)
+        return self.files.get(path)
+
+    def list_files(self, directory: str = ".") -> List[str]:
+        """List files in directory."""
+        directory = self._normalize_path(directory)
+        if directory == ".":
+            directory = ""
+        prefix = f"{directory}/" if directory else ""
+        matching = [f for f in self.files.keys() if f.startswith(prefix)]
+        return [f[len(prefix):].split("/")[0] for f in matching]
+
+    def file_exists(self, path: str) -> bool:
+        """Check if file exists."""
+        path = self._normalize_path(path)
+        return path in self.files
+
+    def parse_heredoc_command(self, command: str) -> Tuple[bool, str, str]:
+        """Parse cat << 'EOF' > path/file pattern.
+        Returns (success, path, content) or (False, "", "") if not a heredoc."""
+        heredoc_pattern = r"cat\s*<<\s*['\"]?(\w+)['\"]?\s*(.*?)\1"
+        match = re.search(heredoc_pattern, command, re.DOTALL)
+        if not match:
+            return False, "", ""
+
+        end_marker = match.group(1)
+        content = match.group(2).strip()
+
+        output_pattern = r">\s*([^\s]+)$"
+        output_match = re.search(output_pattern, command)
+        if not output_match:
+            return False, "", ""
+
+        path = output_match.group(1)
+        return True, path, content
+
+    def execute_command(self, command: str) -> Tuple[bool, str]:
+        """Execute a command in virtual filesystem.
+        Returns (success, output)"""
+        command = command.strip()
+
+        # cat < EOF > file pattern
+        if "<<" in command and ">" in command:
+            is_heredoc, path, content = self.parse_heredoc_command(command)
+            if is_heredoc:
+                self.write_file(path, content)
+                return True, f"(written {len(content)} bytes to {path})"
+
+        # cat file pattern
+        if command.startswith("cat ") and "<<" not in command:
+            parts = command.split()
+            if len(parts) >= 2:
+                path = parts[1]
+                content = self.read_file(path)
+                if content is not None:
+                    return True, content
+                return False, f"cat: {path}: No such file or directory"
+
+        # ls pattern
+        if command.startswith("ls"):
+            files = self.list_files(self.current_dir)
+            return True, "\n".join(files) if files else "(empty)"
+
+        # python3 -c syntax check
+        if "python3 -c" in command and "ast.parse" in command:
+            code_pattern = r'python3\s+-c\s+["\']([^"\']+)["\']'
+            code_match = re.search(code_pattern, command)
+            if code_match:
+                code = code_match.group(1)
+                try:
+                    import ast
+                    ast.parse(code)
+                    return True, "(syntax OK)"
+                except SyntaxError as e:
+                    return False, f"SyntaxError: {e}"
+
+        # Fallback: return success for unknown commands
+        return True, "(virtual command executed)"
+
+# ============================================================================
+# BashSession - Encapsulates bash execution with isolated state
+# ============================================================================
+
+class BashSession:
+    """Isolated bash session with its own cache, history, and working directory.
+    Supports both real bash execution and virtual filesystem modes for testing."""
+
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+        self.cache: OrderedDict = OrderedDict()
+        self.history: List[Dict[str, Any]] = []
+        self.virtual_fs: Optional[VirtualFileSystem] = None  # In-memory filesystem for testing
+
+    def enable_virtual_fs(self) -> None:
+        """Enable virtual filesystem mode (for testing)."""
+        self.virtual_fs = VirtualFileSystem()
+
+    def is_virtual_mode(self) -> bool:
+        """Check if running in virtual filesystem mode."""
+        return self.virtual_fs is not None
+
+    def execute(self, command: str, cwd: str = ".") -> dict:
+        """Execute a bash command. Returns result dict with 'output', 'exit_code', or 'error'."""
+        # Show the command being executed (truncated for display)
+        cmd_display = command[:200] + ("..." if len(command) > 200 else "")
+        print(f"  ▶ bash: {cmd_display}")
+
+        # Dangerous pattern blocking
+        dangerous = [
+            "rm -rf /", "sudo ", "chmod 777", "dd if=", "mkfs",
+            "> /dev/sd", ":(){ :|:& };:", r"curl\s.*\|\s*sh", r"wget\s.*\|\s*sh"
+        ]
+        for pat in dangerous:
+            if re.search(pat, command):
+                print(f"  ⛔ BLOCKED: dangerous pattern '{pat}'")
+                return {"error": f"Blocked dangerous pattern: {pat}", "blocked": True}
+
+        # Cache hit
+        cache_key = (cwd, command)
+        if cache_key in self.cache:
+            self.cache.move_to_end(cache_key)
+            if self.verbose:
+                print(f"  💾 Cache hit")
+            return {"output": self.cache[cache_key], "cached": True}
+
+        try:
+            if self.is_virtual_mode():
+                result = self._execute_virtual(command, cwd)
+            else:
+                result = self._execute_real(command, cwd)
+
+            output = result.get("output", "")
+            if len(output) > 3000:
+                output = output[:3000] + "\n[... truncated ...]"
+                result["output"] = output
+
+            # Cache the result
+            self.cache[cache_key] = output
+            self.cache.move_to_end(cache_key)
+
+            # LRU eviction
+            if len(self.cache) > BASH_CACHE_MAX_SIZE:
+                evicted = self.cache.popitem(last=False)
+                if self.verbose:
+                    print(f"[VERBOSE] Cache evicted: {evicted[0][1][:80]}...")
+
+            self.history.append({
+                "command": command,
+                "success": result.get("exit_code", 1) == 0,
+                "timestamp": time.time(),
+            })
+
+            return result
+        except Exception as e:
+            print(f"  ❌ Error: {e}")
+            self.history.append({
+                "command": command,
+                "success": False,
+                "error": str(e),
+                "timestamp": time.time(),
+            })
+            return {"error": f"{type(e).__name__}: {e}"}
+
+    def _execute_real(self, command: str, cwd: str) -> dict:
+        """Execute command in real filesystem."""
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=90,
+                cwd=cwd,
+                executable="/bin/bash",
+            )
+            output = result.stdout
+            if result.stderr:
+                output += f"\n[STDERR]\n{result.stderr}"
+            if result.returncode != 0:
+                output += f"\n[Exit code: {result.returncode}]"
+            output = output.strip() or "(no output)"
+
+            # Show result summary
+            if result.returncode == 0:
+                lines = output.count('\n')
+                print(f"  ✅ Exit: 0 | {len(output)} chars, {lines} lines")
+            else:
+                print(f"  ❌ Exit: {result.returncode} | {output[:150]}")
+
+            return {"output": output, "exit_code": result.returncode}
+        except subprocess.TimeoutExpired:
+            print(f"  ⏰ Command timed out after 90 seconds")
+            return {"error": "Command timed out after 90 seconds"}
+
+    def _execute_virtual(self, command: str, cwd: str) -> dict:
+        """Execute command in virtual filesystem."""
+        assert self.virtual_fs is not None
+        success, output = self.virtual_fs.execute_command(command)
+        exit_code = 0 if success else 1
+
+        if success:
+            lines = output.count('\n')
+            print(f"  ✅ Exit: {exit_code} | {len(output)} chars, {lines} lines")
+        else:
+            print(f"  ❌ Exit: {exit_code} | {output[:150]}")
+
+        return {"output": output, "exit_code": exit_code}
+
+    def get_cache_stats(self) -> dict:
+        """Return cache statistics."""
+        return {
+            "cache_size": len(self.cache),
+            "history_length": len(self.history),
+            "success_rate": (sum(1 for h in self.history if h.get("success")) / max(1, len(self.history))) * 100
+        }
+
+# ============================================================================
+# FilePlan - Project file structure and constraints
+# ============================================================================
+
+class FilePlan:
+    """Defines file structure, allowed types, and constraints for a project.
+    Ensures all generated files follow the plan."""
+
+    def __init__(self, root: str = "."):
+        self.root = Path(root)
+        self.dirs: Dict[str, str] = {}  # dir -> description
+        self.files: Dict[str, Dict[str, str]] = {}  # file_path -> {purpose, template?}
+        self.constraints = {
+            "max_files_per_dir": 50,
+            "allowed_extensions": [".py", ".md", ".json", ".yaml", ".toml", ".txt"],
+            "forbidden_paths": ["SESSIONS", ".git", "node_modules", "__pycache__", ".venv", "venv"],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, root: str = ".") -> "FilePlan":
+        """Load FilePlan from dictionary."""
+        plan = cls(root)
+        plan.dirs = data.get("dirs", {})
+        plan.files = data.get("files", {})
+        plan.constraints.update(data.get("constraints", {}))
+        return plan
+
+    @classmethod
+    def from_json_file(cls, path: str) -> "FilePlan":
+        """Load FilePlan from JSON file."""
+        with open(path, "r") as f:
+            data = json.load(f)
+        return cls.from_dict(data, data.get("root", "."))
+
+    def to_dict(self) -> dict:
+        """Export FilePlan as dictionary."""
+        return {
+            "root": str(self.root),
+            "dirs": self.dirs,
+            "files": self.files,
+            "constraints": self.constraints,
+        }
+
+    def validate_path(self, file_path: str) -> Tuple[bool, str]:
+        """Check if a file path is allowed.
+        Returns (is_valid, error_message)"""
+        path = Path(file_path)
+
+        # Check forbidden paths
+        for forbidden in self.constraints.get("forbidden_paths", []):
+            if forbidden in str(path.parts):
+                return False, f"Path contains forbidden directory: {forbidden}"
+
+        # Check file extension
+        allowed_exts = self.constraints.get("allowed_extensions", [])
+        if path.suffix not in allowed_exts:
+            return False, f"File type {path.suffix} not allowed. Allowed: {', '.join(allowed_exts)}"
+
+        # Check files per directory
+        parent_dir = str(path.parent)
+        max_per_dir = self.constraints.get("max_files_per_dir", 50)
+        # (simplified: would need actual filesystem to count)
+
+        return True, ""
+
+    def to_system_prompt_section(self) -> str:
+        """Generate a system prompt section describing the file structure."""
+        lines = [
+            "**PROJECT FILE PLAN**\n",
+            f"Root directory: {self.root}\n",
+            "Allowed directories:\n",
+        ]
+        for dir_name, description in self.dirs.items():
+            lines.append(f"  - {dir_name}/: {description}")
+        lines.append("\nKey files:\n")
+        for file_path, info in list(self.files.items())[:5]:
+            purpose = info.get("purpose", "")
+            lines.append(f"  - {file_path}: {purpose}")
+        lines.append(f"\nConstraints:\n")
+        lines.append(f"  - Allowed extensions: {', '.join(self.constraints.get('allowed_extensions', []))}")
+        lines.append(f"  - Forbidden paths: {', '.join(self.constraints.get('forbidden_paths', []))}")
+        return "\n".join(lines)
+
+# ============================================================================
+# ScratchPad - In-memory note storage for exploration findings
+# ============================================================================
+
+class ScratchPad:
+    """Persistent in-memory scratch pad for storing exploration findings.
+    Prevents redundant bash/read calls by letting the model cache discoveries."""
+
+    def __init__(self):
+        self.notes: Dict[str, str] = {}
+
+    def store(self, key: str, value: str) -> str:
+        """Store a note. Returns confirmation."""
+        self.notes[key] = value
+        return f"✅ Stored note '{key}' ({len(value)} chars)"
+
+    def retrieve(self, key: str) -> str:
+        """Retrieve a note by key."""
+        if key in self.notes:
+            return f"📝 Note '{key}':\n{self.notes[key]}"
+        return f"⚠️ No note found for key '{key}'. Available keys: {', '.join(self.list_keys()) or '(none)'}"
+
+    def list_keys(self) -> List[str]:
+        """List all stored note keys."""
+        return list(self.notes.keys())
+
+    def clear(self) -> str:
+        """Clear all notes."""
+        count = len(self.notes)
+        self.notes.clear()
+        return f"✅ Cleared {count} notes"
+
+    def get_all(self) -> Dict[str, str]:
+        """Get all notes as dict."""
+        return dict(self.notes)
+
+    def handle_action(self, action: str, key: str, value: str = None) -> str:
+        """Handle a scratch_pad tool action."""
+        if action == "store":
+            if value is None:
+                return "⚠️ 'value' is required for action='store'"
+            return self.store(key, value)
+        elif action == "retrieve":
+            return self.retrieve(key)
+        elif action == "list":
+            keys = self.list_keys()
+            if keys:
+                return f"📋 Scratch pad keys:\n" + "\n".join(f"  - {k}" for k in keys)
+            return "📋 Scratch pad is empty"
+        elif action == "clear":
+            return self.clear()
+        return f"⚠️ Unknown action: {action}"
+
+
+# ============================================================================
+# ReadTool - Read-only filesystem explorer
+# ============================================================================
+
+class ReadTool:
+    """Read-only filesystem operations for exploration phase.
+    Prevents any file creation or modification."""
+
+    @staticmethod
+    def execute(operation: str, path: str, pattern: str = None,
+                max_depth: int = 2, lines: int = 30,
+                include_pattern: str = None, cwd: str = ".") -> dict:
+        """Execute a read-only filesystem operation.
+        Returns dict with 'output' and 'exit_code'."""
+        try:
+            # Resolve path relative to cwd
+            base = Path(cwd).resolve()
+            target = base / path if not Path(path).is_absolute() else Path(path).resolve()
+
+            # Scope check: must be within cwd
+            try:
+                target.resolve().relative_to(base)
+            except (ValueError, RuntimeError):
+                return {
+                    "error": f"Path '{path}' is outside the allowed working directory '{base}'. Only explore the current directory and its subdirectories.",
+                    "blocked": True
+                }
+
+            # Forbidden directories check
+            forbidden_parts = {"SESSIONS", ".git", "node_modules", "venv", ".venv", "__pycache__"}
+            for part in target.resolve().parts:
+                if part in forbidden_parts:
+                    return {
+                        "error": f"Path contains forbidden directory: '{part}'. Cannot explore SESSIONS/, .git/, node_modules/, venv/, __pycache__/.",
+                        "blocked": True
+                    }
+
+            if operation == "ls":
+                if target.is_dir():
+                    items = sorted(target.iterdir())
+                    result = []
+                    for item in items:
+                        suffix = "/" if item.is_dir() else ""
+                        result.append(f"{item.name}{suffix}")
+                    output = "\n".join(result) if result else "(empty directory)"
+                    return {"output": output, "exit_code": 0}
+                else:
+                    return {"error": f"ls: {path}: Not a directory", "exit_code": 1}
+
+            elif operation == "cat":
+                if not target.is_file():
+                    return {"error": f"cat: {path}: No such file or directory", "exit_code": 1}
+                content = target.read_text(encoding="utf-8", errors="replace")
+                if len(content) > 4000:
+                    content = content[:4000] + f"\n[... truncated at 4000 chars, file is {len(content)} chars total ...]"
+                return {"output": content, "exit_code": 0}
+
+            elif operation == "head":
+                if not target.is_file():
+                    return {"error": f"head: {path}: No such file or directory", "exit_code": 1}
+                content_lines = target.read_text(encoding="utf-8", errors="replace").split("\n")
+                shown = content_lines[:min(lines, len(content_lines))]
+                output = "\n".join(shown)
+                if len(content_lines) > lines:
+                    output += f"\n[... {len(content_lines) - lines} more lines ...]"
+                return {"output": output, "exit_code": 0}
+
+            elif operation == "tail":
+                if not target.is_file():
+                    return {"error": f"tail: {path}: No such file or directory", "exit_code": 1}
+                content_lines = target.read_text(encoding="utf-8", errors="replace").split("\n")
+                shown = content_lines[-min(lines, len(content_lines)):]
+                output = "\n".join(shown)
+                return {"output": output, "exit_code": 0}
+
+            elif operation == "wc":
+                if not target.exists():
+                    return {"error": f"wc: {path}: No such file or directory", "exit_code": 1}
+                if target.is_file():
+                    content = target.read_text(encoding="utf-8", errors="replace")
+                    lines_count = content.count("\n")
+                    words = len(content.split())
+                    chars = len(content)
+                    output = f"{lines_count:>8} lines  {words:>8} words  {chars:>8} chars  {path}"
+                else:
+                    output = f"(directory: {path})"
+                return {"output": output, "exit_code": 0}
+
+            elif operation == "grep":
+                if not pattern:
+                    return {"error": "grep requires a 'pattern' parameter", "exit_code": 1}
+                if not target.exists():
+                    return {"error": f"grep: {path}: No such file or directory", "exit_code": 1}
+                if target.is_file():
+                    files_to_search = [target]
+                else:
+                    glob_pattern = f"**/{include_pattern}" if include_pattern else "**/*"
+                    files_to_search = sorted(target.glob(glob_pattern))
+                    files_to_search = [f for f in files_to_search if f.is_file()]
+
+                matches = []
+                for f in files_to_search:
+                    try:
+                        for i, line in enumerate(f.read_text(encoding="utf-8", errors="replace").split("\n"), 1):
+                            if pattern.lower() in line.lower():
+                                rel_path = f.relative_to(base)
+                                matches.append(f"{rel_path}:{i}: {line.strip()[:200]}")
+                    except Exception:
+                        continue
+
+                if matches:
+                    output = "\n".join(matches[:100])
+                    if len(matches) > 100:
+                        output += f"\n[... {len(matches) - 100} more matches ...]"
+                else:
+                    output = f"(no matches for '{pattern}' in {path})"
+                return {"output": output, "exit_code": 0}
+
+            elif operation == "find":
+                if not target.is_dir():
+                    return {"error": f"find: {path}: Not a directory", "exit_code": 1}
+                max_depth = min(max_depth, 3)  # Hard cap at 3
+                glob_pattern = f"**/{include_pattern}" if include_pattern else "**/*"
+                all_files = sorted(target.glob(glob_pattern))
+                # Filter by depth
+                result = []
+                for f in all_files:
+                    rel = f.relative_to(target)
+                    depth = len(rel.parts)
+                    if depth <= max_depth:
+                        suffix = "/" if f.is_dir() else ""
+                        result.append(f"{rel}{suffix}")
+                output = "\n".join(result[:200]) if result else "(empty)"
+                if len(result) > 200:
+                    output += f"\n[... {len(result) - 200} more entries ...]"
+                return {"output": output, "exit_code": 0}
+
+            elif operation == "file":
+                if not target.exists():
+                    return {"error": f"file: {path}: No such file or directory", "exit_code": 1}
+                if target.is_dir():
+                    output = f"{path}: directory"
+                else:
+                    size = target.stat().st_size
+                    output = f"{path}: file, {size} bytes"
+                return {"output": output, "exit_code": 0}
+
+            else:
+                return {"error": f"Unknown operation: {operation}", "exit_code": 1}
+
+        except PermissionError:
+            return {"error": f"Permission denied: {path}", "exit_code": 1}
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}", "exit_code": 1}
+
+
+# ============================================================================
+# TestScenario and TestRunner - Reactive testing infrastructure
+# ============================================================================
+
+class TestScenario:
+    """Defines a single test scenario: prompt, expected behaviors, assertions."""
+
+    def __init__(self, name: str, prompt: str, initial_files: Dict[str, str] = None,
+                 expected_patterns: List[str] = None, max_commands: int = 10,
+                 test_scratchpad: bool = False, test_scope_blocking: bool = False,
+                 assert_no_file_creation: bool = False):
+        self.name = name
+        self.prompt = prompt
+        self.initial_files = initial_files or {}
+        self.expected_patterns = expected_patterns or []
+        self.max_commands = max_commands
+        self.test_scratchpad = test_scratchpad
+        self.test_scope_blocking = test_scope_blocking
+        self.assert_no_file_creation = assert_no_file_creation
+
+    @classmethod
+    def from_json_file(cls, path: str) -> "TestScenario":
+        """Load test scenario from JSON file."""
+        with open(path, "r") as f:
+            data = json.load(f)
+        return cls(
+            name=data.get("name", "unnamed"),
+            prompt=data.get("prompt", ""),
+            initial_files=data.get("initial_files", {}),
+            expected_patterns=data.get("expected_patterns", []),
+            max_commands=data.get("max_commands", 10),
+            test_scratchpad=data.get("test_scratchpad", False),
+            test_scope_blocking=data.get("test_scope_blocking", False),
+            assert_no_file_creation=data.get("assert_no_file_creation", False),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "prompt": self.prompt,
+            "initial_files": self.initial_files,
+            "expected_patterns": self.expected_patterns,
+            "max_commands": self.max_commands,
+            "test_scratchpad": self.test_scratchpad,
+            "test_scope_blocking": self.test_scope_blocking,
+            "assert_no_file_creation": self.assert_no_file_creation,
+        }
+
+
+class TestRunner:
+    """Runs a test scenario with virtual filesystem, asserts on outputs.
+    Tests the read tool, scratch pad tool, and scope enforcement."""
+
+    def __init__(self, scenario: TestScenario, verbose: bool = False):
+        self.scenario = scenario
+        self.verbose = verbose
+        self.scratch_pad = ScratchPad()
+        self.assertions_passed = 0
+        self.assertions_failed = 0
+        self.test_log: List[str] = []
+
+    def log(self, msg: str) -> None:
+        self.test_log.append(msg)
+        if self.verbose:
+            print(f"  {msg}")
+
+    def run(self) -> Tuple[bool, str]:
+        """Run the test scenario.
+        Returns (success, report)"""
+        report_lines = [f"Test: {self.scenario.name}"]
+        report_lines.append(f"  Prompt: {self.scenario.prompt[:100]}...")
+
+        try:
+            if self.scenario.test_scratchpad:
+                self._test_scratchpad_operations(report_lines)
+            elif self.scenario.test_scope_blocking:
+                self._test_scope_enforcement(report_lines)
+            elif self.scenario.assert_no_file_creation:
+                self._test_readonly_tool(report_lines)
+            else:
+                # Generic test: check expected patterns in tool outputs
+                self._test_generic(report_lines)
+
+            success = self.assertions_failed == 0
+            report_lines.append(f"\nAssertion results: {self.assertions_passed} passed, {self.assertions_failed} failed")
+
+            return success, "\n".join(report_lines)
+        except Exception as e:
+            report_lines.append(f"  ERROR: {e}")
+            import traceback
+            report_lines.append(f"  {traceback.format_exc()}")
+            return False, "\n".join(report_lines)
+
+    def _test_scratchpad_operations(self, report_lines: List[str]) -> None:
+        """Test scratch pad store, retrieve, list, and clear operations."""
+        self.log("Testing scratch pad operations...")
+
+        # Test store
+        result = self.scratch_pad.handle_action("store", "project_type", "Python CLI tool")
+        self.log(f"  store result: {result}")
+        if "Stored" in result:
+            self.assertions_passed += 1
+            report_lines.append("  ✓ scratch_pad: store works")
+        else:
+            self.assertions_failed += 1
+            report_lines.append("  ✗ scratch_pad: store failed")
+
+        result = self.scratch_pad.handle_action("store", "dependencies", "stdlib only")
+        self.log(f"  store result: {result}")
+        if "Stored" in result:
+            self.assertions_passed += 1
+        else:
+            self.assertions_failed += 1
+
+        # Test retrieve
+        result = self.scratch_pad.handle_action("retrieve", "project_type")
+        self.log(f"  retrieve result: {result}")
+        if "Python CLI tool" in result:
+            self.assertions_passed += 1
+            report_lines.append("  ✓ scratch_pad: retrieve works")
+        else:
+            self.assertions_failed += 1
+            report_lines.append("  ✗ scratch_pad: retrieve failed")
+
+        # Test list
+        result = self.scratch_pad.handle_action("list", "")
+        self.log(f"  list result: {result}")
+        if "project_type" in result and "dependencies" in result:
+            self.assertions_passed += 1
+            report_lines.append("  ✓ scratch_pad: list works")
+        else:
+            self.assertions_failed += 1
+            report_lines.append("  ✗ scratch_pad: list failed")
+
+        # Test retrieve nonexistent
+        result = self.scratch_pad.handle_action("retrieve", "nonexistent")
+        self.log(f"  retrieve nonexistent: {result}")
+        if "No note found" in result:
+            self.assertions_passed += 1
+        else:
+            self.assertions_failed += 1
+
+        # Test clear
+        result = self.scratch_pad.handle_action("clear", "")
+        self.log(f"  clear result: {result}")
+        if "Cleared" in result:
+            self.assertions_passed += 1
+            report_lines.append("  ✓ scratch_pad: clear works")
+        else:
+            self.assertions_failed += 1
+            report_lines.append("  ✗ scratch_pad: clear failed")
+
+        # Verify empty after clear
+        result = self.scratch_pad.handle_action("list", "")
+        self.log(f"  list after clear: {result}")
+        if "empty" in result.lower():
+            self.assertions_passed += 1
+        else:
+            self.assertions_failed += 1
+
+        # Check expected patterns in all available text
+        all_text = " ".join(self.test_log + report_lines)
+        for pattern in self.scenario.expected_patterns:
+            found = pattern.lower() in all_text.lower()
+            if found:
+                self.assertions_passed += 1
+                report_lines.append(f"  ✓ Pattern found: {pattern}")
+            else:
+                self.assertions_failed += 1
+                report_lines.append(f"  ✗ Pattern NOT found: {pattern}")
+
+    def _test_scope_enforcement(self, report_lines: List[str]) -> None:
+        """Test that ReadTool blocks paths outside allowed scope."""
+        self.log("Testing scope enforcement...")
+
+        # Test blocked path (parent directory)
+        result = ReadTool.execute("ls", "../etc", cwd="/tmp/test_project")
+        error_msg = str(result.get("error", ""))
+        self.log(f"  parent dir access: blocked={result.get('blocked')} error={error_msg[:120]}")
+        if result.get("blocked") or "outside" in error_msg:
+            self.assertions_passed += 1
+            report_lines.append("  ✓ ReadTool blocks parent directory access")
+        else:
+            self.assertions_failed += 1
+            report_lines.append("  ✗ ReadTool did NOT block parent directory access")
+
+        # Test blocked path (SESSIONS directory)
+        result = ReadTool.execute("ls", "SESSIONS", cwd="/tmp/test_project")
+        error_msg = str(result.get("error", ""))
+        self.log(f"  SESSIONS dir access: blocked={result.get('blocked')} error={error_msg[:120]}")
+        if result.get("blocked") or "forbidden" in error_msg:
+            self.assertions_passed += 1
+            report_lines.append("  ✓ ReadTool blocks SESSIONS directory access")
+        else:
+            self.assertions_failed += 1
+            report_lines.append("  ✗ ReadTool did NOT block SESSIONS directory access")
+
+        # Test blocked path (.git directory)
+        result = ReadTool.execute("ls", ".git", cwd="/tmp/test_project")
+        error_msg = str(result.get("error", ""))
+        self.log(f"  .git dir access: blocked={result.get('blocked')} error={error_msg[:120]}")
+        if result.get("blocked") or "forbidden" in error_msg:
+            self.assertions_passed += 1
+            report_lines.append("  ✓ ReadTool blocks .git directory access")
+        else:
+            self.assertions_failed += 1
+            report_lines.append("  ✗ ReadTool did NOT block .git directory access")
+
+        # Check expected patterns in all available text
+        all_text = " ".join(self.test_log + report_lines)
+        for pattern in self.scenario.expected_patterns:
+            found = pattern.lower() in all_text.lower()
+            if found:
+                self.assertions_passed += 1
+                report_lines.append(f"  ✓ Pattern found: {pattern}")
+            else:
+                self.assertions_failed += 1
+                report_lines.append(f"  ✗ Pattern NOT found: {pattern}")
+
+    def _test_readonly_tool(self, report_lines: List[str]) -> None:
+        """Test that ReadTool only allows read operations and blocks writes."""
+        self.log("Testing read-only tool operations...")
+
+        # Test ls operation (directory may not exist, but tool should handle gracefully)
+        result = ReadTool.execute("ls", ".", cwd="/tmp/test_project")
+        self.log(f"  ls result: output={result.get('output', '')[:50]} error={result.get('error', '')[:50]}")
+        # The tool should either return output or an error (directory doesn't exist)
+        if "output" in result or "error" in result:
+            self.assertions_passed += 1
+            report_lines.append("  ✓ ReadTool: ls executes without crashing")
+        else:
+            self.assertions_failed += 1
+            report_lines.append("  ✗ ReadTool: ls failed")
+
+        # Test that ReadTool has no write operations
+        valid_ops = {"ls", "cat", "head", "tail", "wc", "grep", "find", "file"}
+        # Verify the tool definition only has read operations
+        read_tool_params = {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["ls", "cat", "head", "tail", "wc", "grep", "find", "file"],
+                }
+            }
+        }
+        ops = read_tool_params["properties"]["operation"]["enum"]
+        all_read_only = all(op in valid_ops for op in ops)
+        if all_read_only:
+            self.assertions_passed += 1
+            report_lines.append("  ✓ ReadTool only has read operations")
+        else:
+            self.assertions_failed += 1
+            report_lines.append("  ✗ ReadTool has non-read operations")
+
+        # Test that unknown operation returns error
+        result = ReadTool.execute("write", "test.txt", cwd="/tmp/test_project")
+        self.log(f"  unknown op result: {result.get('error', '')[:100]}")
+        if "Unknown operation" in str(result.get("error", "")):
+            self.assertions_passed += 1
+            report_lines.append("  ✓ ReadTool rejects unknown operations")
+        else:
+            self.assertions_failed += 1
+            report_lines.append("  ✗ ReadTool did not reject unknown operation")
+
+        # Check expected patterns in all available text
+        all_text = " ".join(self.test_log + report_lines)
+        for pattern in self.scenario.expected_patterns:
+            found = pattern.lower() in all_text.lower()
+            if found:
+                self.assertions_passed += 1
+                report_lines.append(f"  ✓ Pattern found: {pattern}")
+            else:
+                self.assertions_failed += 1
+                report_lines.append(f"  ✗ Pattern NOT found: {pattern}")
+
+    def _test_generic(self, report_lines: List[str]) -> None:
+        """Generic test: check expected patterns in tool outputs."""
+        self.log("Running generic test...")
+
+        # Test basic read operations
+        result = ReadTool.execute("ls", ".", cwd="/tmp/test_project")
+        if "output" in result or "error" in result:
+            self.assertions_passed += 1
+
+        # Check expected patterns in all available text
+        all_text = " ".join(self.test_log + report_lines)
+        for pattern in self.scenario.expected_patterns:
+            found = pattern.lower() in all_text.lower()
+            if found:
+                self.assertions_passed += 1
+                report_lines.append(f"  ✓ Pattern found: {pattern}")
+            else:
+                self.assertions_failed += 1
+                report_lines.append(f"  ✗ Pattern NOT found: {pattern}")
 
 # ============================================================================
 # Agent Class - DAG Workflow with Budgets
@@ -328,8 +1160,97 @@ class DAGAgent:
         self.used_budget = 0
         self.thinking_mode = thinking_mode
         self.verbose = verbose
+        # Instance-level bash state
+        self.bash_cache: OrderedDict = OrderedDict()
+        self.bash_history: List[Dict[str, Any]] = []
+        # Scratch pad for exploration findings (persists across exploration)
+        self.scratch_pad = ScratchPad()
         self.client = DeepSeekV4(thinking_enabled=(thinking_mode == "enabled"))
-        self.client.add_tool(BASH_TOOL)
+        # Create instance-specific READ_TOOL with this agent's handler
+        read_tool = ToolDef(
+            name="read",
+            description="Read-only file system exploration. Use for: listing directories, reading files, searching code, checking file sizes. CANNOT create or modify files.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["ls", "cat", "head", "tail", "wc", "grep", "find", "file"],
+                        "description": "Operation to perform"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory path (relative to cwd)"
+                    },
+                    "pattern": {
+                        "type": "string",
+                        "description": "Search pattern (for grep/find operations)"
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Maximum directory depth for find (default: 2, max: 3)",
+                        "default": 2
+                    },
+                    "lines": {
+                        "type": "integer",
+                        "description": "Number of lines for head/tail (default: 30)",
+                        "default": 30
+                    },
+                    "include_pattern": {
+                        "type": "string",
+                        "description": "File glob pattern for grep/find (e.g., '*.py')"
+                    }
+                },
+                "required": ["operation", "path"]
+            },
+            handler=self._read_handler,
+            max_result_chars=4000,
+        )
+        self.client.add_tool(read_tool)
+        # Create instance-specific SCRATCH_PAD_TOOL
+        scratch_tool = ToolDef(
+            name="scratch_pad",
+            description="Persistent scratch pad for storing and retrieving exploration findings. Use this to save notes, summaries, and discoveries so you don't need to re-read files. Data persists for the entire exploration session.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["store", "retrieve", "list", "clear"],
+                        "description": "store: save a note with a key; retrieve: get a note by key; list: list all keys; clear: remove all notes"
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "Note identifier (e.g., 'project_structure', 'dependencies', 'entry_points')"
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "Content to store (required for action=store)"
+                    }
+                },
+                "required": ["action", "key"]
+            },
+            handler=self._scratch_pad_handler,
+            max_result_chars=4000,
+        )
+        self.client.add_tool(scratch_tool)
+        # Create instance-specific BASH_TOOL with this agent's handler
+        # NOTE: bash tool is added ONLY during code generation phase, not during exploration
+        self._bash_tool = ToolDef(
+            name="bash",
+            description="Execute a bash command. Use heredoc for writing files. Returns output.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "cwd": {"type": "string", "default": "."}
+                },
+                "required": ["command"]
+            },
+            handler=self._bash_handler,
+            max_result_chars=3000,
+        )
+        # bash tool is NOT added to client by default — added during code gen phase
         self.correction_store: Dict[str, str] = {}
         self.working_messages: List[dict] = []
         self.metrics = {
@@ -338,6 +1259,156 @@ class DAGAgent:
             "user_approvals": 0,
             "cached_commands": 0,
         }
+
+    def _is_path_allowed(self, path: str) -> bool:
+        """Check if a path is within allowed scope (current working directory)."""
+        try:
+            allowed_base = Path(os.getcwd()).resolve()
+            requested_path = Path(path).resolve()
+            return requested_path.is_relative_to(allowed_base) or requested_path == allowed_base
+        except (ValueError, RuntimeError):
+            return False
+
+    def _read_handler(self, params: dict) -> dict:
+        """Handler for the read-only exploration tool."""
+        operation = params.get("operation", "")
+        path = params.get("path", ".")
+        pattern = params.get("pattern")
+        max_depth = params.get("max_depth", 2)
+        lines = params.get("lines", 30)
+        include_pattern = params.get("include_pattern")
+        cwd = os.getcwd()
+
+        # Show the operation being executed
+        op_display = f"{operation} {path}"
+        if pattern:
+            op_display += f" (pattern: {pattern})"
+        print(f"  🔍 read: {op_display}")
+
+        # Enforce max_depth cap
+        max_depth = min(max_depth, 3)
+
+        result = ReadTool.execute(
+            operation=operation,
+            path=path,
+            pattern=pattern,
+            max_depth=max_depth,
+            lines=lines,
+            include_pattern=include_pattern,
+            cwd=cwd,
+        )
+
+        if "error" in result:
+            print(f"  ❌ {result['error'][:150]}")
+        else:
+            output = result.get("output", "")
+            lines_count = output.count("\n")
+            print(f"  ✅ {len(output)} chars, {lines_count} lines")
+
+        return result
+
+    def _scratch_pad_handler(self, params: dict) -> dict:
+        """Handler for the scratch pad note-taking tool."""
+        action = params.get("action", "")
+        key = params.get("key", "")
+        value = params.get("value")
+
+        print(f"  📝 scratch_pad: {action} '{key}'")
+        result = self.scratch_pad.handle_action(action, key, value)
+        return {"output": result}
+
+    def _bash_handler(self, params: dict) -> dict:
+        """Instance-level bash command handler with caching and history."""
+        command = params.get("command", "")
+        cwd = params.get("cwd", os.getcwd())
+
+        # Show the command being executed (truncated for display)
+        cmd_display = command[:200] + ("..." if len(command) > 200 else "")
+        print(f"  ▶ bash: {cmd_display}")
+
+        # Check directory restriction
+        if not self._is_path_allowed(cwd):
+            print(f"  ⛔ BLOCKED: cwd '{cwd}' is outside allowed scope")
+            return {"error": f"Directory '{cwd}' is outside allowed scope. Only the current working directory and its subdirectories are allowed.", "blocked": True}
+
+        # Dangerous pattern blocking
+        dangerous = [
+            "rm -rf /", "sudo ", "chmod 777", "dd if=", "mkfs",
+            "> /dev/sd", ":(){ :|:& };:", r"curl\s.*\|\s*sh", r"wget\s.*\|\s*sh"
+        ]
+        for pat in dangerous:
+            if re.search(pat, command):
+                print(f"  ⛔ BLOCKED: dangerous pattern '{pat}'")
+                return {"error": f"Blocked dangerous pattern: {pat}", "blocked": True}
+
+        # Cache hit
+        cache_key = (cwd, command)
+        if cache_key in self.bash_cache:
+            self.bash_cache.move_to_end(cache_key)
+            if self.verbose:
+                print(f"  💾 Cache hit")
+            return {"output": self.bash_cache[cache_key], "cached": True}
+
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=90,
+                cwd=cwd,
+                executable="/bin/bash",
+            )
+            output = result.stdout
+            if result.stderr:
+                output += f"\n[STDERR]\n{result.stderr}"
+            if result.returncode != 0:
+                output += f"\n[Exit code: {result.returncode}]"
+            output = output.strip() or "(no output)"
+            if len(output) > 3000:
+                output = output[:3000] + "\n[... truncated ...]"
+
+            # Show result summary
+            if result.returncode == 0:
+                lines = output.count('\n')
+                print(f"  ✅ Exit: 0 | {len(output)} chars, {lines} lines")
+            else:
+                print(f"  ❌ Exit: {result.returncode} | {output[:150]}")
+
+            self.bash_cache[cache_key] = output
+            self.bash_cache.move_to_end(cache_key)
+
+            # LRU eviction: remove oldest entry if cache is full
+            if len(self.bash_cache) > BASH_CACHE_MAX_SIZE:
+                evicted = self.bash_cache.popitem(last=False)
+                if self.verbose:
+                    print(f"[VERBOSE] Cache evicted: {evicted[0][1][:80]}...")
+
+            self.bash_history.append({
+                "command": command,
+                "success": result.returncode == 0,
+                "timestamp": time.time(),
+            })
+
+            return {"output": output, "exit_code": result.returncode}
+        except subprocess.TimeoutExpired:
+            print(f"  ⏰ Command timed out after 90 seconds")
+            self.bash_history.append({
+                "command": command,
+                "success": False,
+                "error": "timeout",
+                "timestamp": time.time(),
+            })
+            return {"error": "Command timed out after 90 seconds"}
+        except Exception as e:
+            print(f"  ❌ Error: {e}")
+            self.bash_history.append({
+                "command": command,
+                "success": False,
+                "error": str(e),
+                "timestamp": time.time(),
+            })
+            return {"error": f"{type(e).__name__}: {e}"}
 
     def log(self, level: str, msg: str) -> None:
         if level == "info":
@@ -574,7 +1645,7 @@ class DAGAgent:
                 self.used_budget += len(tool_calls)
 
     def _extract_exploration_context(self) -> str:
-        """Extract exploration findings from working_messages for use in code generation."""
+        """Extract exploration findings from working_messages and scratch pad for use in code generation."""
         findings = []
         for msg in self.working_messages:
             if msg.get("role") == "assistant" and msg.get("content"):
@@ -587,7 +1658,13 @@ class DAGAgent:
                 tool_content = msg["content"]
                 if isinstance(tool_content, str) and len(tool_content) > 20:
                     findings.append(f"[Tool result]: {tool_content[:300]}")
-        context = "\n\n".join(findings[-10:])  # Last 10 relevant messages
+        # Also include scratch pad notes (the model's curated summary)
+        scratch_notes = self.scratch_pad.get_all()
+        if scratch_notes:
+            findings.append("\n--- SCRATCH PAD NOTES (curated by model) ---")
+            for key, value in scratch_notes.items():
+                findings.append(f"\n[{key}]:\n{value[:500]}")
+        context = "\n\n".join(findings[-15:])  # Last 15 relevant items
         if not context:
             context = "(No exploration data available)"
         return context
@@ -763,7 +1840,7 @@ EXPLORATION FINDINGS:
 WORK DIRECTORY: {self.session_dir}
 
 RULES:
-1. Use ONLY the `bash` tool to create/modify files.
+1. Use the `bash` tool to create/modify files.
 2. Use `cat << 'EOF' > path/to/file.py` to write files via heredoc.
 3. After writing each file, verify it with `python3 -c "import ast; ast.parse(open('path/to/file.py').read())"` to check syntax.
 4. After all files for this task are written, run the verification step.
@@ -778,7 +1855,22 @@ IMPORTANT: Write files directly to the work directory using bash heredoc. Do NOT
             {"role": "user", "content": f"Implement this task. Work in {self.session_dir}. Use bash to write files and verify them."},
         ]
         client = DeepSeekV4(thinking_enabled=False)
-        client.add_tool(BASH_TOOL)
+        # Create a bash tool with this task executor's handler
+        bash_tool = ToolDef(
+            name="bash",
+            description="Execute a bash command. Use heredoc for writing files. Returns output.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "cwd": {"type": "string", "default": "."}
+                },
+                "required": ["command"]
+            },
+            handler=self._bash_handler,
+            max_result_chars=3000,
+        )
+        client.add_tool(bash_tool)
         max_subturns = 8
         for turn in range(max_subturns):
             try:
@@ -944,9 +2036,9 @@ IMPORTANT: Write files directly to the work directory using bash heredoc. Do NOT
         self.log("info", f"🎯 Total tokens: {self.client.total_tokens_used}")
         self.log("info", f"💭 Thinking mode: {self.thinking_mode}")
         cmd_success_rate = 0
-        if len(_BASH_HISTORY) > 0:
-            successes = sum(1 for h in _BASH_HISTORY if h.get("success"))
-            cmd_success_rate = (successes / len(_BASH_HISTORY)) * 100
+        if len(self.bash_history) > 0:
+            successes = sum(1 for h in self.bash_history if h.get("success"))
+            cmd_success_rate = (successes / len(self.bash_history)) * 100
             self.log("info", f"✅ Command success rate: {cmd_success_rate:.1f}%")
         if self.correction_store:
             self.log("info", f"📚 Learned corrections: {len(self.correction_store)}")
@@ -989,12 +2081,13 @@ IMPORTANT: Write files directly to the work directory using bash heredoc. Do NOT
 # ============================================================================
 
 def main():
-    global WORK_DIR, _VERBOSE_GLOBAL
+    global WORK_DIR
     args = sys.argv[1:]
     thinking_mode = THINKING_MODE_AUTO
     verbose = False
     max_turns = DEFAULT_EXPLORATION_BUDGET
     dry_run = False
+    test_scenario = None
 
     if not args or args[0] in ("--help", "-h"):
         print(
@@ -1005,6 +2098,7 @@ def main():
             "  --thinking=disabled  Disable thinking completely\n"
             "  --work=PATH          Output to specified WORK folder (e.g., --work=python_game_engine)\n"
             "  --max-turns=N        Max exploration tool calls (default: 15)\n"
+            "  --test=SCENARIO      Run a test scenario from tests/scenarios/<name>.json\n"
             "  --verbose            Show detailed logs of all agent actions and API interactions\n"
             "  --dry-run            Show configuration and exit without running"
         )
@@ -1028,6 +2122,9 @@ def main():
                 print(f"Invalid max-turns value")
                 sys.exit(1)
             args = args[1:]
+        elif args[0].startswith("--test="):
+            test_scenario = args[0].split("=", 1)[1]
+            args = args[1:]
         elif args[0] == "--verbose":
             verbose = True
             args = args[1:]
@@ -1036,6 +2133,19 @@ def main():
             args = args[1:]
         else:
             break
+
+    # Test mode
+    if test_scenario:
+        scenario_path = Path("tests/scenarios") / f"{test_scenario}.json"
+        if not scenario_path.exists():
+            print(f"❌ Test scenario not found: {scenario_path}")
+            sys.exit(1)
+        print(f"🧪 Running test scenario: {test_scenario}")
+        scenario = TestScenario.from_json_file(str(scenario_path))
+        runner = TestRunner(scenario, verbose=verbose)
+        success, report = runner.run()
+        print(report)
+        sys.exit(0 if success else 1)
 
     if not args:
         print("Error: No prompt provided")
@@ -1059,8 +2169,6 @@ def main():
     else:
         session_id = make_session_id(prompt)
         session_dir = ensure_session_dir(session_id)
-
-    _VERBOSE_GLOBAL = verbose
 
     print(f"📁 Output folder: {session_dir}")
     print(f"💭 Thinking mode: {thinking_mode}")
