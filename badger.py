@@ -45,7 +45,7 @@ from _ds4 import DeepSeekV4, ToolDef
 # AUTOMODE: Global autopilot for testing (auto-approve all commands)
 AUTOMODE = False  # Set to True for hands-free testing # Danger
 
-SESSION_BASE = Path.cwd() / "SESSIONS"
+SESSION_BASE = Path(__file__).parent / "SESSIONS"
 DEFAULT_EXPLORATION_BUDGET = 15  # Soft cap for bash commands in exploration
 EXPLORATION_MAX_TOOL_TURNS = 3   # Allow tool chaining in single API call
 TOKEN_BUDGET_ESTIMATE = 4000
