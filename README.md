@@ -426,7 +426,7 @@ DEFAULT_MODEL = "deepseek-v4-flash"  # or "deepseek-v4" for more power
 ### "K.dat not found"
 Make sure your API key file is one directory *above* the script:
 ```
-/home/user/K.dat                  ← Put it here
+/home/user/projects/K.dat                  ← Put it here
 /home/user/projects/
   └── deep-badger/
       └── badger.py               ← Script is here
