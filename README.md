@@ -4,8 +4,6 @@
 
 Deep Badger is an intelligent agentic CLI that explores your codebase, asks the *right* questions, writes professional Product Requirement Documents (PRD), and then executes the tasks to build the project — all powered by [DeepSeek V4](https://www.deepseek.com/).
 
-**NOTE**: IT IS RECOMMENDED TO RUN THIS IN A SANDBOX AS AGENTIC PROCESSES CAN BE UNPREDICTABLE.
-
 Author: g023
 License: MIT
 
@@ -29,10 +27,10 @@ No fluff. No hallucinations. Just a structured, verifiable plan — and the code
 
 ### 1. Set Up Your API Key
 
-Place your DeepSeek API key in a file **one directory above** where the script lives (e.g., `../K.dat` relative to `ds_cli.py`):
+Place your DeepSeek API key in a file **one directory above** where the script lives (e.g., `../K.dat` relative to `badger.py`):
 
 ```bash
-# If ds_cli.py is in /home/user/projects/deep-badger/ds_cli.py, create:
+# If badger.py is in /home/user/projects/deep-badger/badger.py, create:
 /home/user/projects/K.dat
 
 # Add your key:
@@ -50,10 +48,10 @@ export DEEPSEEK_API_KEY="sk-your-key"
 ```bash
 # From anywhere, analyze a folder
 cd /tmp/some-random-folder
-python3 /path/to/deep-badger/ds_cli.py "A Python package for real-time data streaming"
+python3 /path/to/deep-badger/badger.py "A Python package for real-time data streaming"
 
 # Or with a specific output folder
-python3 ds_cli.py --work=my_project "Describe what you want to build"
+python3 badger.py --work=my_project "Describe what you want to build"
 ```
 
 ### 3. Watch It Explore
@@ -84,7 +82,7 @@ The agent thinks out loud. Every command has a reason. Every discovery moves you
 ### Example 1: Python Game Engine
 
 ```bash
-python3 ds_cli.py --work=game_engine \
+python3 badger.py --work=game_engine \
   "A 2D roguelike game engine with turn-based combat and procedural dungeon generation"
 ```
 
@@ -98,7 +96,7 @@ python3 ds_cli.py --work=game_engine \
 ### Example 2: API Refactor
 
 ```bash
-python3 ds_cli.py --work=api_refactor \
+python3 badger.py --work=api_refactor \
   "Refactor the legacy authentication system to OAuth2 with JWT tokens. Current system uses session cookies."
 ```
 
@@ -114,7 +112,7 @@ Then writes a PRD with migration strategy and rollback plan, and executes the re
 
 ```bash
 # You're in /tmp/lunch-break
-python3 ~/dev/deep-badger/ds_cli.py "Fast API for multiplayer tic-tac-toe"
+python3 ~/dev/deep-badger/badger.py "Fast API for multiplayer tic-tac-toe"
 
 # Outputs to SESSIONS/[timestamp]/ wherever you are
 # No context pollution, no temp files left behind
@@ -144,13 +142,13 @@ By default, thinking is **disabled** to save tokens. You can control it:
 
 ```bash
 # Force thinking on for architecture reviews
-python3 ds_cli.py --thinking=enabled "Design a scalable microservice mesh"
+python3 badger.py --thinking=enabled "Design a scalable microservice mesh"
 
 # Turn it off completely for speed
-python3 ds_cli.py --thinking=disabled "Fix typo in README"
+python3 badger.py --thinking=disabled "Fix typo in README"
 
 # Auto mode (default) — enables thinking for complex/long prompts
-python3 ds_cli.py --thinking=auto "Add a login button to the homepage"
+python3 badger.py --thinking=auto "Add a login button to the homepage"
 ```
 
 ### ✅ Automatic Readiness Checks
@@ -170,7 +168,7 @@ Once all gaps are closed: **READY: true** → PRD generation begins.
 ### 💾 Zero External Dependencies
 
 Both files are pure Python 3.9+ with **zero pip dependencies**:
-- `ds_cli.py` — The orchestrator (DAG agent, budget management, exploration loops, code generation)
+- `badger.py` — The orchestrator (DAG agent, budget management, exploration loops, code generation)
 - `_ds4.py` — A minimal DeepSeek client (no `requests`, no `httpx`, no `aiohttp` — just `urllib`)
 
 Just run it. It works.
@@ -185,7 +183,7 @@ sudo chmod 777     ❌ Blocked
 curl ... | sh      ❌ Blocked
 ```
 
-Optional autopilot for testing (edit `AUTOMODE = True` in `ds_cli.py`):
+Optional autopilot for testing (edit `AUTOMODE = True` in `badger.py`):
 
 ```python
 AUTOMODE = True  # Set to True for hands-free testing — use only in sandboxed environments!
@@ -226,7 +224,7 @@ If interrupted, the session saves a `checkpoint.json` so you can resume where yo
 ## 📋 Flag Reference
 
 ```bash
-ds_cli.py [OPTIONS] "Project description"
+badger.py [OPTIONS] "Project description"
 
 OPTIONS:
   --thinking={auto|enabled|disabled}
@@ -353,7 +351,7 @@ Up to **10 iterations** are attempted before declaring completion.
 
 ## 🔧 Advanced: Customization
 
-Edit `ds_cli.py` to tweak behavior:
+Edit `badger.py` to tweak behavior:
 
 ```python
 # Exploration budget
@@ -399,7 +397,7 @@ DEFAULT_MODEL = "deepseek-v4-flash"  # or "deepseek-v4" for more power
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                   ds_cli.py                      │
+│                   badger.py                      │
 │  ┌─────────────┐   ┌─────────────────────────┐  │
 │  │ DAGAgent     │   │  bash_handler()         │  │
 │  │  - explore   │──▶│  - LRU cache            │  │
@@ -431,13 +429,13 @@ Make sure your API key file is one directory *above* the script:
 /home/user/K.dat                  ← Put it here
 /home/user/projects/
   └── deep-badger/
-      └── ds_cli.py               ← Script is here
+      └── badger.py               ← Script is here
 ```
 
 Or set the env var:
 ```bash
 export DEEPSEEK_API_KEY="sk-..."
-python3 ds_cli.py "Your prompt"
+python3 badger.py "Your prompt"
 ```
 
 ### "DeepSeek HTTP 429: Rate Limited"
@@ -446,7 +444,7 @@ The client has built-in exponential backoff. Just wait — it'll retry automatic
 If it keeps happening, you've hit the API rate limit. Wait 30 seconds and try again.
 
 ### "Thinking mode is too slow"
-Use `--thinking=disabled` for faster results, or adjust `THINKING_MODE_THRESHOLD` in `ds_cli.py`.
+Use `--thinking=disabled` for faster results, or adjust `THINKING_MODE_THRESHOLD` in `badger.py`.
 
 ### Agent got stuck or ran out of budget
 Session state is saved to `checkpoint.json`. You can resume later (future feature).
@@ -532,9 +530,9 @@ User: "Design a microservice architecture"
 
 ## 🎓 Learning Resources
 
-Want to understand how prd_cli works?
+Want to understand how Deep Badger works?
 
-1. **Read `ds_cli.py`** (740 lines)
+1. **Read `badger.py`** (740 lines)
    - Agent orchestration logic
    - Exploration vs. writing phases
    - Readiness self-assessment
@@ -556,26 +554,26 @@ Want to understand how prd_cli works?
 
 ### 1. Analyze This Repo
 ```bash
-cd /wherever/prd_cli/lives
-python3 ds_cli.py "Analyze the prd_cli codebase and document its architecture"
+cd /wherever/deep_badger/lives
+python3 badger.py "Analyze the deep_badger codebase and document its architecture"
 ```
 
 ### 2. Document Your Own Project
 ```bash
 cd /home/you/your-cool-project
-python3 /path/to/prd_cli/ds_cli.py "Describe what this project does"
+python3 /path/to/deep_badger/badger.py "Describe what this project does"
 ```
 
 ### 3. Plan a Feature
 ```bash
-python3 ds_cli.py --thinking=enabled --work=oauth_sprint \
+python3 badger.py --thinking=enabled --work=oauth_sprint \
   "I need to add OAuth2 authentication to my Flask app. Current state: basic session auth with SQLite. Target: OAuth2 with JWT."
 ```
 
 ### 4. Reverse-Engineer Legacy Code
 ```bash
 cd /path/to/legacy/monster-app
-python3 ds_cli.py "What does this codebase do? Map all the modules and their interactions."
+python3 badger.py "What does this codebase do? Map all the modules and their interactions."
 ```
 
 ---
