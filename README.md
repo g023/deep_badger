@@ -4,6 +4,8 @@
 
 Deep Badger is an intelligent agentic CLI that explores your codebase, asks the *right* questions, writes professional Product Requirement Documents (PRD), and then executes the tasks to build the project — all powered by [DeepSeek V4](https://www.deepseek.com/).
 
+**NOTE:** AGENTIC PROCESSES ARE UNPREDICTABLE. USE CAUTION AND A SANDBOX TO RUN FOR BEST PROTECTION. This is still a work-in-progress. Feel free to help me test and improve. 
+
 Author: g023
 License: MIT
 
